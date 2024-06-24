@@ -5,9 +5,11 @@ import numpy as np
 from torch import autocast
 from contextlib import nullcontext
 
-from models.mn.model import get_model as get_mobilenet, get_ensemble_model
-from models.preprocess import AugmentMelSTFT
-from helpers.utils import NAME_TO_WIDTH, labels
+from .models.mn.model import get_model as get_mobilenet
+from .models.dymn.model import get_model as get_dymn
+
+from .models.preprocess import AugmentMelSTFT
+from .helpers.utils import NAME_TO_WIDTH, labels
 
 class EATagger:
     """
@@ -44,7 +46,9 @@ class EATagger:
         sample_rate=32000,
         window_size=800,
         hop_size=320, 
-        n_mels=128):
+        n_mels=128, 
+        strides=[2, 2, 2, 2],
+        head_type="mlp"):
 
         self.device = torch.device('cuda') if device == 'cuda' and torch.cuda.is_available() else torch.device('cpu')
         self.sample_rate = sample_rate
@@ -53,12 +57,18 @@ class EATagger:
         self.n_mels = n_mels
 
         # load pre-trained model
-        if ensemble is not None:
-            self.model = get_ensemble_model(ensemble)
-        elif model_name is not None:
-            self.model = get_mobilenet(width_mult=NAME_TO_WIDTH(model_name), pretrained_name=model_name)
+        if model_name.startswith("dymn"):
+            self.model = get_dymn(width_mult=NAME_TO_WIDTH(model_name), pretrained_name=model_name,
+                                  strides=strides)
         else:
-            raise ValueError('Please provide a model name or an ensemble of models')
+            self.model = get_mobilenet(width_mult=NAME_TO_WIDTH(model_name), pretrained_name=model_name,
+                                  strides=strides, head_type=head_type)
+        # if ensemble is not None:
+        #     self.model = get_ensemble_model(ensemble)
+        # elif model_name is not None:
+        #     self.model = get_mobilenet(width_mult=NAME_TO_WIDTH(model_name), pretrained_name=model_name)
+        # else:
+        #     raise ValueError('Please provide a model name or an ensemble of models')
 
         self.model.to(self.device)
         self.model.eval()
@@ -68,7 +78,7 @@ class EATagger:
         self.mel.to(self.device)
         self.mel.eval()
 
-    def tag_audio_window(self, audio_path, window_size=20.0, hop_length=10.0):
+    def tag_audio_window(self, audio_path, window_size=10, hop_length=5):
         """
             Tags an audio file with an acoustic event.
             Args:
@@ -98,51 +108,97 @@ class EATagger:
 
         with torch.no_grad(), autocast(device_type=self.device.type) if self.device.type == 'cuda' else nullcontext():
             tags = []
+            features = []
             for i in range(n_windows):
                 start = i * hop_length
                 end = start + window_size
                 spec = self.mel(waveform[:, start:end])
-                preds, features = self.model(spec.unsqueeze(0))
+                preds, feature = self.model(spec.unsqueeze(0))
                 preds = torch.sigmoid(preds.float()).squeeze().cpu().numpy()
                 sorted_indexes = np.argsort(preds)[::-1]
-
-                # Print audio tagging top probabilities
                 tags.append({
-                    'start': start / self.sample_rate,
-                    'end': end / self.sample_rate,
+                    'start': f'{start / self.sample_rate}',
+                    'end': f'{end / self.sample_rate}',
                     'tags': [{
-                        'tag': labels[sorted_indexes[k]],
-                        'probability': preds[sorted_indexes[k]]
-                    } for k in range(10)]
+                        'idx': int(sorted_indexes[k]),
+                        'label': labels[sorted_indexes[k]],
+                        'probability': float(preds[sorted_indexes[k]])
+                    } for k in range(5)]
                 })
-
+                features.append(feature.cpu().numpy())
                 # progress bar
                 print(f'\rProgress: {i+1}/{n_windows}', end='')
-            print()
 
+        return tags, features
+    
+    def tag_audio_array(self, waveform, sr=16000):
+        """
+            Tags an audio file with an acoustic event.
+            Args:
+                audio_path (str): path to the audio file
+            Returns:
+                List of dictionaries with the following keys:
+                    - 'start': start time of the window in seconds
+                    - 'end': end time of the window in seconds
+                    - 'tags': list of tags for the window in dictionary format
+                        - 'tag': name of the tag
+                        - 'probability': confidence of the tag
+                
+        """
 
-        return tags
-        
+        # load audio file
+        if len(waveform.shape) != 1:
+            waveform = waveform.mean(axis=0)
+        waveform = librosa.core.resample(y=waveform, orig_sr=sr, target_sr=self.sample_rate)
+        waveform = torch.from_numpy(waveform[None, :].astype(np.float32)).to(self.device)
+        with torch.no_grad(), autocast(device_type=self.device.type) if self.device.type == 'cuda' else nullcontext():
+            spec = self.mel(waveform)
+            preds, feature = self.model(spec.unsqueeze(0))
+            preds = torch.sigmoid(preds.float()).squeeze().cpu().numpy()
+            sorted_indexes = np.argsort(preds)[::-1]
+            tags =  [{
+                    'idx': int(sorted_indexes[k]),
+                    'label': labels[sorted_indexes[k]],
+                    'probability': float(preds[sorted_indexes[k]])
+                } for k in range(5)]
+            feature = feature.cpu().numpy()
+        return tags, feature
 
 
 if __name__ == '__main__':
+    import json
+    import os
+    from tqdm import tqdm
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='mn10_as', help='model name')
-    parser.add_argument('--cuda', action='store_true', default=False)
-    parser.add_argument('--audio_path', type=str, help='path to the audio file', required=True)
-    parser.add_argument('--window_size', type=float, default=10.0, help='window size in seconds')
-    parser.add_argument('--hop_length', type=float, default=2.5, help='hop length in seconds')
+    parser.add_argument('--model_name', type=str, default='dymn10_as', help='model name')
+    parser.add_argument('--cuda', action='store_true', default=True)
+    parser.add_argument('--audio_path', type=str, help='path to the audio file', required=False, default='egoexo')
+    parser.add_argument('--window_size', type=float, default=1, help='window size in seconds')
+    parser.add_argument('--hop_length', type=float, default=1, help='hop length in seconds')
     args = parser.parse_args()
 
     # load the model
-    model = EATagger(model_name=args.model, device='cuda' if args.cuda else 'cpu')
+    model = EATagger(model_name=args.model_name, device='cuda' if args.cuda else 'cpu')
 
-    # tag the audio file
-    tags = model.tag_audio_window(args.audio_path, window_size=args.window_size, hop_length=args.hop_length)
-    
-    # for each window, print the top 5 tags and their probabilities
-    for window in tags:
-        print(f'Window: {window["start"]:.2f} - {window["end"]:.2f}')
-        for tag in window['tags'][:5]:
-            print(f'\t{tag["tag"]}: {tag["probability"]:.2f}')
-        print()
+    if args.audio_path == 'egoexo':
+        data_dir = '../../dataset/egoexo/takes'
+        takes = os.listdir(data_dir)
+        for take in tqdm(takes):
+            files = os.listdir(os.path.join(data_dir, take))
+            for file in files:
+                if file.endswith('.flac'):
+                    audio_path = os.path.join(data_dir, take, file)
+                    tags, features = model.tag_audio_window(audio_path, window_size=args.window_size, hop_length=args.hop_length)
+                    features = np.concatenate(features, axis=0)
+                    np.save(os.path.join(data_dir, take, 'audio_feature.npy'), features)                    
+                    json_file = os.path.join(data_dir, take, 'audio_tag.json')
+                    json.dump(tags, open(json_file, 'w'), indent=4)
+                    print(json_file)
+    else:
+        tags, features = model.tag_audio_window(args.audio_path, window_size=args.window_size, hop_length=args.hop_length)
+        features = np.concatenate(features, axis=0)
+        save_dir = os.path.dirname(args.audio_path)
+        np.save(os.path.join(save_dir, 'audio_feature.npy'), features)
+        json_file = os.path.join(save_dir, 'audio_tag.json')
+        json.dump(tags, open(json_file, 'w'), indent=4)
+        print(json_file)
